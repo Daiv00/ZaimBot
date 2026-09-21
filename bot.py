@@ -1,310 +1,740 @@
-
-import os, re, asyncio
-from datetime import datetime
+import asyncio
+import os
+import re
+import secrets
+import string
+import tempfile
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 
-import asyncpg
-from fastapi import FastAPI, Request, HTTPException
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import Command
+from fastapi import FastAPI, Header, HTTPException, Request
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, FSInputFile, Update
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
 )
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 
 import config
 
-pool = None
-bot = Bot(config.BOT_TOKEN)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 
-STATUS = {
-    "review": "🟡 На рассмотрении",
-    "approved": "🟢 Одобрено",
-    "rejected": "🔴 Отказано",
-    "paid": "💸 Выдано",
-}
+# -----------------------------
+# In-memory state only
+# -----------------------------
 
-class LoanForm(StatesGroup):
-    full_name=State(); phone=State(); birth_date=State(); address=State()
-    passport_data=State(); registration_address=State(); amount=State()
-    term_months=State(); bank_details=State(); passport_photo=State()
-    registration_photo=State(); selfie_photo=State(); personal_confirm=State()
-    final_confirm=State()
+applications = {}
+user_to_application = {}
 
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS applications (
- id SERIAL PRIMARY KEY,
- telegram_user_id BIGINT NOT NULL,
- telegram_username TEXT,
- full_name TEXT NOT NULL,
- phone TEXT NOT NULL,
- birth_date TEXT NOT NULL,
- address TEXT NOT NULL,
- passport_data TEXT NOT NULL,
- registration_address TEXT NOT NULL,
- amount INTEGER NOT NULL,
- term_months INTEGER NOT NULL,
- bank_details TEXT NOT NULL,
- passport_photo TEXT,
- registration_photo TEXT,
- selfie_photo TEXT,
- personal_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
- final_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
- status TEXT NOT NULL DEFAULT 'review',
- rejection_reason TEXT,
- contract_path TEXT,
- paid_at TIMESTAMPTZ,
- created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
+
+class ApplicationForm(StatesGroup):
+    fio = State()
+    phone = State()
+    birth_date = State()
+    address = State()
+    passport = State()
+    registration = State()
+    amount = State()
+    term = State()
+    bank = State()
+    passport_photo = State()
+    registration_photo = State()
+    selfie = State()
+    personal_confirm = State()
+    final_confirm = State()
+
+
+bot = Bot(token=config.BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+def new_id() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "LN-" + "".join(secrets.choice(alphabet) for _ in range(7))
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in config.ADMIN_IDS
+
+
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Подать заявку")],
+            [KeyboardButton(text="📋 Мои заявки")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True,
+    )
+
+
+def confirm_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтверждаю",
+                    callback_data="personal_yes",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="personal_no",
+                ),
+            ]
+        ]
+    )
+
+
+def final_keyboard(app_id: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Отправить заявку",
+                    callback_data=f"final_yes:{app_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"final_no:{app_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def admin_keyboard(app_id: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🟢 Одобрить",
+                    callback_data=f"approve:{app_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🔴 Отказать",
+                    callback_data=f"reject:{app_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💸 Выдано",
+                    callback_data=f"paid:{app_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def format_application(app: dict) -> str:
+    status = {
+        "review": "🟡 На рассмотрении",
+        "approved": "🟢 Одобрено",
+        "rejected": "🔴 Отказ",
+        "paid": "💸 Выдано",
+    }.get(app["status"], app["status"])
+
+    return (
+        f"📄 ЗАЯВКА {app['id']}\n"
+        f"Статус: {status}\n\n"
+        f"👤 ФИО: {app.get('fio', '-')}\n"
+        f"📞 Телефон: {app.get('phone', '-')}\n"
+        f"🎂 Дата рождения: {app.get('birth_date', '-')}\n"
+        f"🏠 Адрес проживания: {app.get('address', '-')}\n"
+        f"🪪 Паспортные данные: {app.get('passport', '-')}\n"
+        f"📍 Адрес регистрации: {app.get('registration', '-')}\n"
+        f"💰 Сумма займа: {app.get('amount', '-')}\n"
+        f"📅 Срок: {app.get('term', '-')}\n"
+        f"🏦 Банк и реквизиты: {app.get('bank', '-')}\n\n"
+        f"Telegram ID: {app['user_id']}\n"
+        f"Создана: {app['created_at']}"
+    )
+
+
+async def safe_delete(path: str | None):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+async def send_contract(user_id: int, app: dict):
+    Path(config.CONTRACT_DIR).mkdir(parents=True, exist_ok=True)
+    path = Path(config.CONTRACT_DIR) / f"{app['id']}.pdf"
+
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+    c = canvas.Canvas(str(path), pagesize=A4)
+    width, height = A4
+
+    if os.path.exists(font_path):
+        pdfmetrics.registerFont(TTFont("DejaVu", font_path))
+        if os.path.exists(bold_path):
+            pdfmetrics.registerFont(TTFont("DejaVuBold", bold_path))
+        normal = "DejaVu"
+        bold = "DejaVuBold" if os.path.exists(bold_path) else "DejaVu"
+    else:
+        normal = "Helvetica"
+        bold = "Helvetica-Bold"
+
+    c.setFont(bold, 16)
+    c.drawString(50, height - 60, "ПРОЕКТ ДОГОВОРА ЗАЙМА")
+
+    y = height - 100
+    c.setFont(normal, 10)
+
+    lines = [
+        f"Номер заявки: {app['id']}",
+        f"Дата: {datetime.now().strftime('%d.%m.%Y')}",
+        "",
+        f"Заемщик: {app.get('fio', '-')}",
+        f"Телефон: {app.get('phone', '-')}",
+        f"Дата рождения: {app.get('birth_date', '-')}",
+        f"Адрес: {app.get('address', '-')}",
+        f"Паспорт: {app.get('passport', '-')}",
+        f"Адрес регистрации: {app.get('registration', '-')}",
+        f"Сумма займа: {app.get('amount', '-')}",
+        f"Срок: {app.get('term', '-')}",
+        f"Банк и реквизиты: {app.get('bank', '-')}",
+        "",
+        "Статус: одобрено.",
+        "",
+        "Настоящий документ является проектом и требует",
+        "юридической проверки и согласования условий.",
+    ]
+
+    for line in lines:
+        c.drawString(50, y, line[:120])
+        y -= 18
+        if y < 60:
+            c.showPage()
+            c.setFont(normal, 10)
+            y = height - 60
+
+    c.save()
+
+    await bot.send_document(
+        user_id,
+        FSInputFile(str(path)),
+        caption=f"📄 Проект договора по заявке {app['id']}.",
+    )
+
+
+async def notify_admins(app: dict):
+    if not config.ADMIN_CHAT_ID:
+        return
+
+    await bot.send_message(
+        config.ADMIN_CHAT_ID,
+        format_application(app),
+        reply_markup=admin_keyboard(app["id"]),
+    )
+
+    labels = [
+        ("🪪 Фото паспорта", app.get("passport_photo")),
+        ("📍 Фото регистрации", app.get("registration_photo")),
+        ("🤳 Селфи с паспортом", app.get("selfie")),
+    ]
+
+    for caption, path in labels:
+        if path and os.path.exists(path):
+            await bot.send_document(
+                config.ADMIN_CHAT_ID,
+                FSInputFile(path),
+                caption=f"{caption} — {app['id']}",
+            )
+
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Здравствуйте! Здесь можно подать заявку на займ.\n\n"
+        "Нажмите «📝 Подать заявку», чтобы начать.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@dp.message(F.text == "❌ Отмена")
+async def cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Заявка отменена.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@dp.message(F.text == "📝 Подать заявку")
+async def begin(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(ApplicationForm.fio)
+    await message.answer(
+        "Введите ФИО полностью:",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@dp.message(F.text == "📋 Мои заявки")
+async def my_applications(message: Message):
+    user_apps = [
+        a for a in applications.values()
+        if a["user_id"] == message.from_user.id
+    ]
+
+    if not user_apps:
+        await message.answer("У вас пока нет заявок.", reply_markup=main_keyboard())
+        return
+
+    text = "📋 Ваши заявки:\n\n"
+    for app in user_apps:
+        status = {
+            "review": "🟡 рассмотрение",
+            "approved": "🟢 одобрение",
+            "rejected": "🔴 отказ",
+            "paid": "💸 выдано",
+        }.get(app["status"], app["status"])
+        text += f"{app['id']} — {status}\n"
+
+    await message.answer(text, reply_markup=main_keyboard())
+
+
+@dp.message(ApplicationForm.fio)
+async def fio(message: Message, state: FSMContext):
+    await state.update_data(fio=message.text)
+    await state.set_state(ApplicationForm.phone)
+    await message.answer("Введите номер телефона:")
+
+
+@dp.message(ApplicationForm.phone)
+async def phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(ApplicationForm.birth_date)
+    await message.answer("Введите дату рождения:")
+
+
+@dp.message(ApplicationForm.birth_date)
+async def birth_date(message: Message, state: FSMContext):
+    await state.update_data(birth_date=message.text)
+    await state.set_state(ApplicationForm.address)
+    await message.answer("Введите адрес проживания:")
+
+
+@dp.message(ApplicationForm.address)
+async def address(message: Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await state.set_state(ApplicationForm.passport)
+    await message.answer("Введите паспортные данные:")
+
+
+@dp.message(ApplicationForm.passport)
+async def passport(message: Message, state: FSMContext):
+    await state.update_data(passport=message.text)
+    await state.set_state(ApplicationForm.registration)
+    await message.answer("Введите адрес регистрации:")
+
+
+@dp.message(ApplicationForm.registration)
+async def registration(message: Message, state: FSMContext):
+    await state.update_data(registration=message.text)
+    await state.set_state(ApplicationForm.amount)
+    await message.answer("Введите сумму займа:")
+
+
+@dp.message(ApplicationForm.amount)
+async def amount(message: Message, state: FSMContext):
+    await state.update_data(amount=message.text)
+    await state.set_state(ApplicationForm.term)
+    await message.answer("Введите срок займа:")
+
+
+@dp.message(ApplicationForm.term)
+async def term(message: Message, state: FSMContext):
+    await state.update_data(term=message.text)
+    await state.set_state(ApplicationForm.bank)
+    await message.answer("Введите банк и реквизиты для выдачи:")
+
+
+@dp.message(ApplicationForm.bank)
+async def bank(message: Message, state: FSMContext):
+    await state.update_data(bank=message.text)
+    await state.set_state(ApplicationForm.passport_photo)
+    await message.answer("Отправьте фото паспорта одним сообщением.")
+
+
+async def require_photo(message: Message, text: str):
+    if not message.photo:
+        await message.answer(text)
+        return False
+    return True
+
+
+@dp.message(ApplicationForm.passport_photo)
+async def passport_photo(message: Message, state: FSMContext):
+    if not await require_photo(message, "Нужно отправить именно фото паспорта."):
+        return
+
+    file = await bot.get_file(message.photo[-1].file_id)
+    Path(config.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    path = Path(config.UPLOAD_DIR) / f"{message.from_user.id}_{secrets.token_hex(4)}_passport.jpg"
+    await bot.download_file(file.file_path, destination=str(path))
+
+    await state.update_data(passport_photo=str(path))
+    await state.set_state(ApplicationForm.registration_photo)
+    await message.answer("Теперь отправьте фото документа о регистрации.")
+
+
+@dp.message(ApplicationForm.registration_photo)
+async def registration_photo(message: Message, state: FSMContext):
+    if not await require_photo(message, "Нужно отправить именно фото регистрации."):
+        return
+
+    file = await bot.get_file(message.photo[-1].file_id)
+    Path(config.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    path = Path(config.UPLOAD_DIR) / f"{message.from_user.id}_{secrets.token_hex(4)}_registration.jpg"
+    await bot.download_file(file.file_path, destination=str(path))
+
+    await state.update_data(registration_photo=str(path))
+    await state.set_state(ApplicationForm.selfie)
+    await message.answer("Теперь отправьте селфи с паспортом.")
+
+
+@dp.message(ApplicationForm.selfie)
+async def selfie(message: Message, state: FSMContext):
+    if not await require_photo(message, "Нужно отправить селфи с паспортом."):
+        return
+
+    file = await bot.get_file(message.photo[-1].file_id)
+    Path(config.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    path = Path(config.UPLOAD_DIR) / f"{message.from_user.id}_{secrets.token_hex(4)}_selfie.jpg"
+    await bot.download_file(file.file_path, destination=str(path))
+
+    data = await state.get_data()
+    data["selfie"] = str(path)
+
+    app_id = new_id()
+    app = {
+        **data,
+        "id": app_id,
+        "user_id": message.from_user.id,
+        "status": "draft",
+        "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+    }
+    applications[app_id] = app
+    user_to_application[message.from_user.id] = app_id
+
+    await state.update_data(app_id=app_id)
+    await state.set_state(ApplicationForm.personal_confirm)
+
+    await message.answer(
+        "Проверьте данные заявки:\n\n"
+        + format_application(app)
+        + "\n\n"
+        "Перед отправкой подтвердите согласие на обработку "
+        "персональных данных.",
+        reply_markup=confirm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "personal_no")
+async def personal_no(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+    await call.message.answer(
+        "Заявка отменена.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "personal_yes")
+async def personal_yes(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    app_id = data.get("app_id")
+    app = applications.get(app_id)
+
+    if not app:
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    await state.set_state(ApplicationForm.final_confirm)
+    await call.answer()
+
+    await call.message.answer(
+        "Последний шаг.\n\n"
+        "Нажмите «Отправить заявку», чтобы передать заявку "
+        "администратору.",
+        reply_markup=final_keyboard(app_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("final_no:"))
+async def final_no(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+    await call.message.answer(
+        "Заявка отменена.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("final_yes:"))
+async def final_yes(call: CallbackQuery, state: FSMContext):
+    app_id = call.data.split(":", 1)[1]
+    app = applications.get(app_id)
+
+    if not app:
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    app["status"] = "review"
+
+    await notify_admins(app)
+    await state.clear()
+
+    await call.answer("Заявка отправлена")
+    await call.message.answer(
+        f"✅ Заявка {app_id} отправлена на рассмотрение.",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def change_status(call: CallbackQuery, app_id: str, status: str):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    app = applications.get(app_id)
+    if not app:
+        await call.answer(
+            "Заявка отсутствует в памяти текущего запуска бота.",
+            show_alert=True,
+        )
+        return
+
+    app["status"] = status
+
+    status_text = {
+        "approved": "🟢 Ваша заявка одобрена.",
+        "rejected": "🔴 По вашей заявке получен отказ.",
+        "paid": "💸 По вашей заявке отмечена выдача займа.",
+    }[status]
+
+    await bot.send_message(app["user_id"], status_text)
+
+    if status == "approved":
+        await send_contract(app["user_id"], app)
+        await bot.send_message(
+            app["user_id"],
+            f"📄 Договор также доступен командой /contract_{app_id}",
+        )
+
+    await call.answer("Статус изменён")
+
+    try:
+        await call.message.edit_text(
+            format_application(app),
+            reply_markup=admin_keyboard(app_id),
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("approve:"))
+async def approve(call: CallbackQuery):
+    await change_status(call, call.data.split(":", 1)[1], "approved")
+
+
+@dp.callback_query(F.data.startswith("reject:"))
+async def reject(call: CallbackQuery):
+    await change_status(call, call.data.split(":", 1)[1], "rejected")
+
+
+@dp.callback_query(F.data.startswith("paid:"))
+async def paid(call: CallbackQuery):
+    await change_status(call, call.data.split(":", 1)[1], "paid")
+
+
+def command_app_id(text: str, command: str):
+    prefix = f"/{command}_"
+    if text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return None
+
+
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    if not applications:
+        await message.answer("Заявок в памяти текущего запуска нет.")
+        return
+
+    items = list(applications.values())[-50:]
+    text = "📋 Заявки за текущий запуск:\n\n"
+    for app in reversed(items):
+        text += f"{app['id']} — {app['status']} — {app['fio']}\n"
+
+    await message.answer(text)
+
+
+@dp.message(F.text.startswith("/approve_"))
+async def approve_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    app_id = command_app_id(message.text, "approve")
+    app = applications.get(app_id)
+    if not app:
+        await message.answer("Заявка не найдена в памяти текущего запуска.")
+        return
+    app["status"] = "approved"
+    await bot.send_message(app["user_id"], "🟢 Ваша заявка одобрена.")
+    await send_contract(app["user_id"], app)
+    await message.answer(f"Заявка {app_id}: одобрено.")
+
+
+@dp.message(F.text.startswith("/reject_"))
+async def reject_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    app_id = command_app_id(message.text, "reject")
+    app = applications.get(app_id)
+    if not app:
+        await message.answer("Заявка не найдена в памяти текущего запуска.")
+        return
+    app["status"] = "rejected"
+    await bot.send_message(app["user_id"], "🔴 По вашей заявке получен отказ.")
+    await message.answer(f"Заявка {app_id}: отказ.")
+
+
+@dp.message(F.text.startswith("/paid_"))
+async def paid_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    app_id = command_app_id(message.text, "paid")
+    app = applications.get(app_id)
+    if not app:
+        await message.answer("Заявка не найдена в памяти текущего запуска.")
+        return
+    app["status"] = "paid"
+    await bot.send_message(app["user_id"], "💸 По вашей заявке отмечена выдача займа.")
+    await message.answer(f"Заявка {app_id}: выдача отмечена.")
+
+
+@dp.message(F.text.startswith("/case_"))
+async def case_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    app_id = command_app_id(message.text, "case")
+    app = applications.get(app_id)
+    if not app:
+        await message.answer("Заявка не найдена в памяти текущего запуска.")
+        return
+
+    await message.answer(format_application(app))
+
+
+@dp.message(F.text.startswith("/contract_"))
+async def contract_command(message: Message):
+    app_id = command_app_id(message.text, "contract")
+    app = applications.get(app_id)
+    if not app:
+        await message.answer(
+            "Эта заявка не найдена в памяти текущего запуска. "
+            "Если бот перезапускался, старые данные доступны в админ-чате."
+        )
+        return
+
+    if app["user_id"] != message.from_user.id and not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    await send_contract(message.from_user.id, app)
+
+
+@dp.message()
+async def fallback(message: Message):
+    await message.answer(
+        "Используйте кнопки меню.",
+        reply_markup=main_keyboard(),
+    )
+
+
+# -----------------------------
+# FastAPI / Render webhook
+# -----------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool
-    pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=5)
-    await pool.execute(CREATE_SQL)
     if not config.BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан в Render Environment.")
+        raise RuntimeError("BOT_TOKEN is not set")
+    if not config.ADMIN_CHAT_ID:
+        raise RuntimeError("ADMIN_CHAT_ID is not set")
     if not config.RENDER_EXTERNAL_URL:
-        raise RuntimeError("RENDER_EXTERNAL_URL не задан.")
-    webhook = config.RENDER_EXTERNAL_URL.rstrip("/") + config.WEBHOOK_PATH
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL is not available. "
+            "Add your Render service URL manually as RENDER_EXTERNAL_URL."
+        )
+
+    webhook_url = f"{config.RENDER_EXTERNAL_URL}{config.WEBHOOK_PATH}"
+
     await bot.set_webhook(
-        webhook,
+        webhook_url,
         secret_token=config.WEBHOOK_SECRET or None,
-        drop_pending_updates=True,
+        allowed_updates=dp.resolve_used_update_types(),
     )
+
     yield
+
     await bot.delete_webhook()
-    await pool.close()
     await bot.session.close()
 
-app = FastAPI(title="Loan Telegram Bot", lifespan=lifespan)
 
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "loan-telegram-bot"}
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
+
 @app.post(config.WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
     if config.WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != config.WEBHOOK_SECRET:
-            raise HTTPException(status_code=403, detail="Forbidden")
+        if x_telegram_bot_api_secret_token != config.WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret")
+
     data = await request.json()
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
-
-def main_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📝 Подать заявку")],
-        [KeyboardButton(text="📋 Мои заявки")]
-    ], resize_keyboard=True)
-
-def confirm_kb(prefix):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтверждаю", callback_data=f"{prefix}:yes")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{prefix}:no")]
-    ])
-
-def admin_kb(i):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 Одобрить", callback_data=f"approve:{i}"),
-         InlineKeyboardButton(text="🔴 Отказать", callback_data=f"reject:{i}")],
-        [InlineKeyboardButton(text="💸 Выдано", callback_data=f"paid:{i}")]
-    ])
-
-def is_admin(uid): return uid in config.ADMIN_IDS
-
-async def get_app(i):
-    return await pool.fetchrow("SELECT * FROM applications WHERE id=$1", i)
-
-def create_contract(a):
-    os.makedirs(config.CONTRACT_DIR, exist_ok=True)
-    path=f"{config.CONTRACT_DIR}/contract_{a['id']}.pdf"
-    c=canvas.Canvas(path,pagesize=A4); y=A4[1]-60
-    for line in [
-        config.COMPANY_NAME,"","ПРОЕКТ ДОГОВОРА ЗАЙМА","",
-        f"Номер заявки: {a['id']}",f"Дата: {datetime.now():%d.%m.%Y}","",
-        f"Заемщик: {a['full_name']}",f"Дата рождения: {a['birth_date']}",
-        f"Сумма займа: {a['amount']} руб.",f"Срок: {a['term_months']} мес.",
-        f"Банк/реквизиты: {a['bank_details']}","",
-        "Документ является проектом договора и требует юридической проверки."
-    ]:
-        c.drawString(50,y,line[:110]); y-=20
-    c.save(); return path
-
-@router.message(Command("start"))
-async def start(m:Message,state:FSMContext):
-    await state.clear()
-    await m.answer("Здравствуйте!\n\nЗдесь можно подать заявку на займ и отслеживать её статус.",reply_markup=main_kb())
-
-@router.message(F.text=="📝 Подать заявку")
-async def begin(m:Message,state:FSMContext):
-    await state.clear(); await state.set_state(LoanForm.full_name); await m.answer("Введите ФИО:")
-
-async def text_field(m,s,next_state,key,prompt):
-    await s.update_data(**{key:m.text.strip()}); await s.set_state(next_state); await m.answer(prompt)
-
-@router.message(LoanForm.full_name)
-async def f1(m,s): await text_field(m,s,LoanForm.phone,"full_name","Введите номер телефона:")
-@router.message(LoanForm.phone)
-async def f2(m,s): await text_field(m,s,LoanForm.birth_date,"phone","Введите дату рождения (ДД.ММ.ГГГГ):")
-@router.message(LoanForm.birth_date)
-async def f3(m,s): await text_field(m,s,LoanForm.address,"birth_date","Введите адрес проживания:")
-@router.message(LoanForm.address)
-async def f4(m,s): await text_field(m,s,LoanForm.passport_data,"address","Введите паспортные данные:")
-@router.message(LoanForm.passport_data)
-async def f5(m,s): await text_field(m,s,LoanForm.registration_address,"passport_data","Введите адрес регистрации:")
-@router.message(LoanForm.registration_address)
-async def f6(m,s): await text_field(m,s,LoanForm.amount,"registration_address","Введите сумму займа в рублях:")
-
-@router.message(LoanForm.amount)
-async def f7(m,s):
-    try: v=int(m.text.replace(" ","").replace(",","")); assert v>0
-    except: return await m.answer("Введите положительное целое число.")
-    await s.update_data(amount=v); await s.set_state(LoanForm.term_months); await m.answer("Введите срок в месяцах:")
-
-@router.message(LoanForm.term_months)
-async def f8(m,s):
-    try: v=int(m.text); assert v>0
-    except: return await m.answer("Введите количество месяцев целым числом.")
-    await s.update_data(term_months=v); await s.set_state(LoanForm.bank_details); await m.answer("Введите банк и реквизиты:")
-
-@router.message(LoanForm.bank_details)
-async def f9(m,s):
-    await s.update_data(bank_details=m.text.strip()); await s.set_state(LoanForm.passport_photo); await m.answer("📷 Отправьте фото паспорта:")
-
-async def save_photo(m,s,key):
-    if not m.photo:
-        await m.answer("Отправьте именно фотографию."); return False
-    folder=f"{config.UPLOAD_DIR}/{m.from_user.id}"; os.makedirs(folder,exist_ok=True)
-    p=f"{folder}/{key}_{m.photo[-1].file_id}.jpg"
-    await m.bot.download(m.photo[-1],destination=p)
-    await s.update_data(**{key:p}); return True
-
-@router.message(LoanForm.passport_photo)
-async def p1(m,s):
-    if await save_photo(m,s,"passport_photo"):
-        await s.set_state(LoanForm.registration_photo); await m.answer("📷 Отправьте фото регистрации:")
-
-@router.message(LoanForm.registration_photo)
-async def p2(m,s):
-    if await save_photo(m,s,"registration_photo"):
-        await s.set_state(LoanForm.selfie_photo); await m.answer("🤳 Отправьте селфи с паспортом:")
-
-@router.message(LoanForm.selfie_photo)
-async def p3(m,s):
-    if await save_photo(m,s,"selfie_photo"):
-        await s.set_state(LoanForm.personal_confirm)
-        await m.answer("Подтвердите согласие на обработку персональных данных.",reply_markup=confirm_kb("personal"))
-
-@router.callback_query(F.data=="personal:yes")
-async def personal(c,s):
-    await s.update_data(personal_confirmed=True); d=await s.get_data()
-    text=(f"📋 Проверьте заявку\n\nФИО: {d['full_name']}\nТелефон: {d['phone']}\n"
-          f"Дата рождения: {d['birth_date']}\nАдрес: {d['address']}\nПаспорт: {d['passport_data']}\n"
-          f"Регистрация: {d['registration_address']}\nСумма: {d['amount']} руб.\n"
-          f"Срок: {d['term_months']} мес.\nБанк: {d['bank_details']}\n\nПодтвердить отправку?")
-    await s.set_state(LoanForm.final_confirm); await c.message.edit_text(text,reply_markup=confirm_kb("final")); await c.answer()
-
-@router.callback_query(F.data=="personal:no")
-async def personal_no(c,s): await s.clear(); await c.message.edit_text("Заявка отменена."); await c.answer()
-
-@router.callback_query(F.data=="final:no")
-async def final_no(c,s): await s.clear(); await c.message.edit_text("Заявка не отправлена."); await c.answer()
-
-@router.callback_query(F.data=="final:yes")
-async def final_yes(c,s):
-    d=await s.get_data()
-    row=await pool.fetchrow("""INSERT INTO applications
-    (telegram_user_id,telegram_username,full_name,phone,birth_date,address,passport_data,
-    registration_address,amount,term_months,bank_details,passport_photo,registration_photo,
-    selfie_photo,personal_confirmed,final_confirmed,status)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,TRUE,TRUE,'review')
-    RETURNING id""",
-    c.from_user.id,c.from_user.username,d["full_name"],d["phone"],d["birth_date"],d["address"],
-    d["passport_data"],d["registration_address"],d["amount"],d["term_months"],d["bank_details"],
-    d.get("passport_photo"),d.get("registration_photo"),d.get("selfie_photo"))
-    i=row["id"]; await s.clear()
-    await c.message.edit_text(f"✅ Заявка #{i} принята.\nСтатус: 🟡 На рассмотрении.")
-    if config.NOTIFY_CHAT_ID:
-        await c.bot.send_message(config.NOTIFY_CHAT_ID,
-            f"🆕 Новая заявка #{i}\n\nФИО: {d['full_name']}\nТелефон: {d['phone']}\n"
-            f"Сумма: {d['amount']} руб.\nСрок: {d['term_months']} мес.\n\n"
-            f"/approve_{i}\n/reject_{i}\n/paid_{i}\n/case_{i}",reply_markup=admin_kb(i))
-    await c.answer()
-
-@router.message(F.text=="📋 Мои заявки")
-async def mine(m):
-    rows=await pool.fetch("SELECT * FROM applications WHERE telegram_user_id=$1 ORDER BY id DESC",m.from_user.id)
-    if not rows: return await m.answer("📋 Заявок нет.")
-    await m.answer("\n\n".join(f"#{a['id']} — {STATUS.get(a['status'],a['status'])}\nСумма: {a['amount']} руб.\nСрок: {a['term_months']} мес." for a in rows))
-
-async def set_status(i,status):
-    a=await get_app(i)
-    if not a: return False,"Заявка не найдена."
-    path=a["contract_path"]
-    if status=="approved": path=create_contract(a)
-    paid=a["paid_at"] or (datetime.now() if status=="paid" else None)
-    await pool.execute("UPDATE applications SET status=$1,contract_path=$2,paid_at=$3 WHERE id=$4",status,path,paid,i)
-    try:
-        extra=f"\n\nДоговор: /contract_{i}" if status=="approved" else ""
-        await bot.send_message(a["telegram_user_id"],f"Заявка #{i}: {STATUS[status]}{extra}")
-    except Exception: pass
-    return True,STATUS[status]
-
-async def show_case(m,i):
-    if not is_admin(m.from_user.id): return
-    a=await get_app(i)
-    if not a: return await m.answer("Заявка не найдена.")
-    await m.answer(f"📄 Выписка #{i}\n\nTelegram ID: {a['telegram_user_id']}\nUsername: @{a['telegram_username'] or '-'}\n"
-        f"ФИО: {a['full_name']}\nТелефон: {a['phone']}\nДата рождения: {a['birth_date']}\n"
-        f"Адрес: {a['address']}\nПаспорт: {a['passport_data']}\nРегистрация: {a['registration_address']}\n"
-        f"Сумма: {a['amount']}\nСрок: {a['term_months']}\nБанк: {a['bank_details']}\n"
-        f"Статус: {STATUS.get(a['status'],a['status'])}\n"
-        f"Фото паспорта: {bool(a['passport_photo'])}\nФото регистрации: {bool(a['registration_photo'])}\nСелфи: {bool(a['selfie_photo'])}")
-
-@router.message(Command("admin"))
-async def admin(m):
-    if not is_admin(m.from_user.id): return
-    rows=await pool.fetch("SELECT * FROM applications ORDER BY id DESC LIMIT 50")
-    if not rows: return await m.answer("Заявок нет.")
-    for a in rows:
-        await m.answer(f"Заявка #{a['id']}\n\nФИО: {a['full_name']}\nТелефон: {a['phone']}\n"
-                       f"Сумма: {a['amount']} руб.\nСрок: {a['term_months']} мес.\n"
-                       f"Статус: {STATUS.get(a['status'],a['status'])}",reply_markup=admin_kb(a["id"]))
-
-@router.message(F.text.regexp(r"^/(approve|reject|paid|case)_\d+$"))
-async def admin_cmd(m):
-    if not is_admin(m.from_user.id): return
-    x=re.match(r"^/(approve|reject|paid|case)_(\d+)$",m.text)
-    action,i=x.group(1),int(x.group(2))
-    if action=="case": return await show_case(m,i)
-    ok,res=await set_status(i,{"approve":"approved","reject":"rejected","paid":"paid"}[action])
-    await m.answer(res if not ok else f"Заявка #{i}: {res}")
-
-@router.callback_query(F.data.startswith(("approve:","reject:","paid:")))
-async def admin_buttons(c):
-    if not is_admin(c.from_user.id): return await c.answer("Нет доступа.",show_alert=True)
-    action,i=c.data.split(":"); ok,res=await set_status(int(i),{"approve":"approved","reject":"rejected","paid":"paid"}[action])
-    await c.answer(res if ok else "Ошибка"); await c.message.answer(f"Заявка #{i}: {res}")
-
-@router.message(F.text.regexp(r"^/contract_\d+$"))
-async def contract(m):
-    i=int(re.search(r"\d+",m.text).group()); a=await get_app(i)
-    if not a or a["telegram_user_id"]!=m.from_user.id: return await m.answer("Заявка не найдена.")
-    if a["status"] not in ("approved","paid"): return await m.answer("Договор доступен после одобрения.")
-    path=a["contract_path"] or create_contract(a)
-    await pool.execute("UPDATE applications SET contract_path=$1 WHERE id=$2",path,i)
-    await m.answer_document(FSInputFile(path),caption=f"Проект договора по заявке #{i}")
