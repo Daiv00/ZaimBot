@@ -1,13 +1,11 @@
 services:
   - type: web
     name: loan-telegram-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn bot:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.8"
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_CHAT_ID

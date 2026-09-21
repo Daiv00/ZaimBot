@@ -79,3 +79,11 @@ PDF договора является техническим шаблоном и
 Python is explicitly pinned to `3.12.8` in `render.yaml` and `.python-version`.
 Do not remove this setting. It prevents Render's current Python 3.14 default from
 trying to compile incompatible dependency versions during deployment.
+
+## Docker
+
+This version uses Docker with Python 3.12-slim, so Render's native Python 3.14
+runtime is not used.
+
+For an existing Render service, make sure its Runtime is Docker or create the
+service from the updated `render.yaml`.
